@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Upload, Download, Copy, FileText, Gift, Zap } from 'lucide-react';
+import { Upload, Download, Copy, FileText, Gift, Zap, AlertCircle } from 'lucide-react';
 import '../styles/VoucherLotteryMachine.css';
 import mascotImage from '../assets/mascot_uv.svg';
 
@@ -11,36 +11,42 @@ const VoucherLotteryMachine = () => {
   const [showConfetti, setShowConfetti] = useState(false);
   const [selectedBallIndex, setSelectedBallIndex] = useState(-1);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState({ 
+    lines: 0, 
+    vouchers: 0, 
+    percentage: 0,
+    chunksProcessed: 0,
+    totalChunks: 0
+  });
   const [fileInfo, setFileInfo] = useState({ name: '', size: 0 });
   const [ballsKey, setBallsKey] = useState(0);
+  const [voucherCount, setVoucherCount] = useState(0);
+  const [isLargeDataset, setIsLargeDataset] = useState(false);
   
   const fileInputRef = useRef(null);
   const voucherListRef = useRef([]);
   const workerRef = useRef(null);
+  const abortControllerRef = useRef(null);
 
-  // Simple text processing function - NO REGEX
-  const processVoucherText = useCallback((text) => {
+  // Quick text processing for small datasets (< 10K lines)
+  const processVoucherTextQuick = useCallback((text) => {
     if (!text || text.trim() === '') return [];
     
-    // Replace different line endings with standard newline
-    let normalizedText = text;
-    if (normalizedText.includes('\r\n')) {
-      normalizedText = normalizedText.split('\r\n').join('\n');
-    }
-    if (normalizedText.includes('\r')) {
-      normalizedText = normalizedText.split('\r').join('\n');
+    // Count lines first to determine processing method
+    const lineCount = (text.match(/\n/g) || []).length + 1;
+    if (lineCount > 10000) {
+      return null; // Use worker for large datasets
     }
     
-    // Split by newlines first
+    // Fast processing for small datasets
+    let normalizedText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const lines = normalizedText.split('\n');
     const vouchers = [];
     
-    // Process each line
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (line === '') continue;
       
-      // Check if line contains comma
       if (line.includes(',')) {
         const parts = line.split(',');
         for (let j = 0; j < parts.length; j++) {
@@ -57,82 +63,156 @@ const VoucherLotteryMachine = () => {
     return vouchers;
   }, []);
 
-  // Memoized voucher processing - COMPLETELY SAFE
-  const voucherStats = useMemo(() => {
-    const vouchers = processVoucherText(voucherData);
-    voucherListRef.current = vouchers;
-    return {
-      count: vouchers.length,
-      hasData: vouchers.length > 0
-    };
-  }, [voucherData, processVoucherText]);
-
-  // Enhanced Web Worker - NO REGEX AT ALL
+  // Enhanced Web Worker with streaming and chunked processing
   useEffect(() => {
     const workerCode = `
-      // Safe text processing function inside worker
-      function processText(text) {
-        if (!text || text.trim() === '') return [];
-        
-        // Replace line endings safely
-        var normalizedText = text;
-        while (normalizedText.indexOf('\\r\\n') > -1) {
-          normalizedText = normalizedText.replace('\\r\\n', '\\n');
+      // Enhanced streaming processor with better progress tracking
+      class StreamProcessor {
+        constructor() {
+          this.vouchers = [];
+          this.buffer = '';
+          this.processedLines = 0;
+          this.processedChunks = 0;
+          this.totalEstimatedLines = 0;
+          this.chunkSize = 10000;
+          this.lastProgressReport = 0;
         }
-        while (normalizedText.indexOf('\\r') > -1) {
-          normalizedText = normalizedText.replace('\\r', '\\n');
+        
+        setTotalEstimatedLines(estimate) {
+          this.totalEstimatedLines = estimate;
         }
         
-        // Split by newlines
-        var lines = normalizedText.split('\\n');
-        var vouchers = [];
-        
-        // Process each line
-        for (var i = 0; i < lines.length; i++) {
-          var line = lines[i];
-          if (line) {
-            line = line.trim();
+        processChunk(text, isLast = false, chunkIndex = 0, totalChunks = 0) {
+          this.processedChunks++;
+          
+          // Add to buffer
+          this.buffer += text;
+          
+          // Process complete lines only
+          const lines = this.buffer.split('\\n');
+          
+          // Keep incomplete line in buffer (unless it's the last chunk)
+          if (!isLast && lines.length > 0) {
+            this.buffer = lines.pop();
+          } else {
+            this.buffer = '';
+          }
+          
+          // Process complete lines in this chunk
+          let vouchersInChunk = 0;
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
             if (line === '') continue;
             
-            // Check for comma
             if (line.indexOf(',') > -1) {
-              var parts = line.split(',');
-              for (var j = 0; j < parts.length; j++) {
-                var voucher = parts[j].trim();
+              const parts = line.split(',');
+              for (let j = 0; j < parts.length; j++) {
+                const voucher = parts[j].trim();
                 if (voucher !== '') {
-                  vouchers.push(voucher);
+                  this.vouchers.push(voucher);
+                  vouchersInChunk++;
                 }
               }
             } else {
-              vouchers.push(line);
+              this.vouchers.push(line);
+              vouchersInChunk++;
             }
+            
+            this.processedLines++;
           }
           
-          // Progress update every 50k lines
-          if (i > 0 && i % 50000 === 0) {
+          // Report progress more frequently for better UX
+          const now = Date.now();
+          if (now - this.lastProgressReport > 500 || isLast) { // Every 500ms or final
+            const progressPercentage = totalChunks > 0 ? (chunkIndex + 1) / totalChunks * 100 : 0;
+            
             self.postMessage({
               type: 'PROGRESS',
-              processed: i,
-              total: lines.length
+              processed: this.processedLines,
+              voucherCount: this.vouchers.length,
+              chunkIndex: chunkIndex + 1,
+              totalChunks: totalChunks,
+              progressPercentage: Math.min(progressPercentage, 100),
+              vouchersInLastChunk: vouchersInChunk
             });
+            
+            this.lastProgressReport = now;
           }
         }
         
-        return vouchers;
+        getResult() {
+          return this.vouchers;
+        }
       }
       
+      let processor = null;
+      
       self.onmessage = function(e) {
-        var data = e.data;
-        var text = data.text;
-        var type = data.type;
+        const data = e.data;
         
-        if (type === 'PROCESS_VOUCHERS') {
+        if (data.type === 'START_PROCESSING') {
+          processor = new StreamProcessor();
+          self.postMessage({ type: 'PROCESSING_STARTED' });
+        }
+        
+        if (data.type === 'PROCESS_CHUNK') {
+          if (processor) {
+            processor.processChunk(
+              data.chunk, 
+              data.isLast, 
+              data.chunkIndex || 0, 
+              data.totalChunks || 0
+            );
+            
+            if (data.isLast) {
+              const vouchers = processor.getResult();
+              self.postMessage({
+                type: 'PROCESSING_COMPLETE',
+                vouchers: vouchers,
+                totalVouchers: vouchers.length
+              });
+              processor = null;
+            }
+          }
+        }
+        
+        if (data.type === 'PROCESS_SMALL') {
+          // For small datasets, process normally
           try {
-            var vouchers = processText(text);
+            const text = data.text;
+            let normalizedText = text;
+            
+            while (normalizedText.indexOf('\\r\\n') > -1) {
+              normalizedText = normalizedText.replace('\\r\\n', '\\n');
+            }
+            while (normalizedText.indexOf('\\r') > -1) {
+              normalizedText = normalizedText.replace('\\r', '\\n');
+            }
+            
+            const lines = normalizedText.split('\\n');
+            const vouchers = [];
+            
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i].trim();
+              if (line === '') continue;
+              
+              if (line.indexOf(',') > -1) {
+                const parts = line.split(',');
+                for (let j = 0; j < parts.length; j++) {
+                  const voucher = parts[j].trim();
+                  if (voucher !== '') {
+                    vouchers.push(voucher);
+                  }
+                }
+              } else {
+                vouchers.push(line);
+              }
+            }
             
             self.postMessage({
-              type: 'VOUCHERS_PROCESSED',
-              vouchers: vouchers
+              type: 'PROCESSING_COMPLETE',
+              vouchers: vouchers,
+              totalVouchers: vouchers.length
             });
           } catch (error) {
             self.postMessage({
@@ -142,16 +222,15 @@ const VoucherLotteryMachine = () => {
           }
         }
         
-        if (type === 'SELECT_WINNER') {
+        if (data.type === 'SELECT_WINNER') {
           try {
-            var vouchers = data.vouchers;
+            const vouchers = data.vouchers;
             if (vouchers.length === 0) {
               throw new Error('No vouchers available');
             }
             
-            // Safe random selection
-            var randomIndex = Math.floor(Math.random() * vouchers.length);
-            var winner = vouchers[randomIndex];
+            const randomIndex = Math.floor(Math.random() * vouchers.length);
+            const winner = vouchers[randomIndex];
             
             self.postMessage({
               type: 'WINNER_SELECTED',
@@ -165,6 +244,11 @@ const VoucherLotteryMachine = () => {
             });
           }
         }
+        
+        if (data.type === 'ABORT') {
+          processor = null;
+          self.postMessage({ type: 'ABORTED' });
+        }
       };
     `;
 
@@ -172,17 +256,59 @@ const VoucherLotteryMachine = () => {
     workerRef.current = new Worker(URL.createObjectURL(blob));
 
     workerRef.current.onmessage = (e) => {
-      const { type, vouchers, winner, error, processed, total } = e.data;
+      const { 
+        type, 
+        vouchers, 
+        processed, 
+        voucherCount, 
+        winner, 
+        error, 
+        totalVouchers,
+        chunkIndex,
+        totalChunks,
+        progressPercentage
+      } = e.data;
       
-      if (type === 'PROGRESS') {
-        console.log(`Processing: ${processed}/${total} lines`);
+      if (type === 'PROCESSING_STARTED') {
+        setProcessingProgress({ 
+          lines: 0, 
+          vouchers: 0, 
+          percentage: 0,
+          chunksProcessed: 0,
+          totalChunks: 0
+        });
       }
       
-      if (type === 'VOUCHERS_PROCESSED') {
+      if (type === 'PROGRESS') {
+        setProcessingProgress({
+          lines: processed || 0,
+          vouchers: voucherCount || 0,
+          percentage: progressPercentage || 0,
+          chunksProcessed: chunkIndex || 0,
+          totalChunks: totalChunks || 0
+        });
+        setVoucherCount(voucherCount || 0);
+      }
+      
+      if (type === 'PROCESSING_COMPLETE') {
         voucherListRef.current = vouchers;
+        setVoucherCount(totalVouchers);
         setIsProcessing(false);
+        setProcessingProgress({ 
+          lines: 0, 
+          vouchers: 0, 
+          percentage: 100,
+          chunksProcessed: 0,
+          totalChunks: 0
+        });
         setBallsKey(prev => prev + 1);
-        console.log(`Successfully processed ${vouchers.length} vouchers`);
+        
+        console.log(`✅ Successfully processed ${totalVouchers} vouchers`);
+        
+        // Show completion notification for large datasets
+        if (totalVouchers > 50000) {
+          alert(`🎉 Berhasil memproses ${totalVouchers.toLocaleString()} voucher! Siap untuk undian.`);
+        }
       }
       
       if (type === 'WINNER_SELECTED') {
@@ -201,7 +327,26 @@ const VoucherLotteryMachine = () => {
         console.error('Worker error:', error);
         setIsSpinning(false);
         setIsProcessing(false);
-        alert('Terjadi kesalahan saat memproses data: ' + error);
+        setProcessingProgress({ 
+          lines: 0, 
+          vouchers: 0, 
+          percentage: 0,
+          chunksProcessed: 0,
+          totalChunks: 0
+        });
+        alert('❌ Terjadi kesalahan saat memproses data: ' + error);
+      }
+      
+      if (type === 'ABORTED') {
+        setIsProcessing(false);
+        setProcessingProgress({ 
+          lines: 0, 
+          vouchers: 0, 
+          percentage: 0,
+          chunksProcessed: 0,
+          totalChunks: 0
+        });
+        console.log('🛑 Processing aborted by user');
       }
     };
 
@@ -212,7 +357,60 @@ const VoucherLotteryMachine = () => {
     };
   }, []);
 
-  // Lottery balls generation
+  // Enhanced file processing with better progress tracking
+  const processFileStreaming = useCallback((file) => {
+    return new Promise((resolve, reject) => {
+      const chunkSize = 1024 * 1024; // 1MB chunks
+      const totalChunks = Math.ceil(file.size / chunkSize);
+      let chunkIndex = 0;
+      
+      // Start processing
+      workerRef.current.postMessage({ type: 'START_PROCESSING' });
+      
+      const readNextChunk = () => {
+        const start = chunkIndex * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const slice = file.slice(start, end);
+        const reader = new FileReader();
+        
+        reader.onload = (e) => {
+          const chunk = e.target.result;
+          const isLast = end >= file.size;
+          
+          workerRef.current.postMessage({
+            type: 'PROCESS_CHUNK',
+            chunk: chunk,
+            isLast: isLast,
+            chunkIndex: chunkIndex,
+            totalChunks: totalChunks
+          });
+          
+          if (!isLast) {
+            chunkIndex++;
+            // Use setTimeout to prevent blocking and allow progress updates
+            setTimeout(readNextChunk, 50);
+          } else {
+            resolve();
+          }
+        };
+        
+        reader.onerror = reject;
+        reader.readAsText(slice, 'UTF-8');
+      };
+      
+      readNextChunk();
+    });
+  }, []);
+
+  // Memoized voucher stats
+  const voucherStats = useMemo(() => {
+    return {
+      count: voucherCount,
+      hasData: voucherCount > 0
+    };
+  }, [voucherCount]);
+
+  // Lottery balls generation (optimized)
   const lotteryBalls = useMemo(() => {
     const ballColors = [
       '#FF6B6B', '#4ECDC4', '#45B7D1', 
@@ -225,6 +423,7 @@ const VoucherLotteryMachine = () => {
     for (let i = 0; i < 6; i++) {
       let sampleVoucher;
       if (vouchers.length > 0) {
+        // Sample from first 100 vouchers for better performance
         const sampleSize = Math.min(vouchers.length, 100);
         const randomIndex = Math.floor(Math.random() * sampleSize);
         sampleVoucher = vouchers[randomIndex];
@@ -300,41 +499,95 @@ const VoucherLotteryMachine = () => {
     }, 4000);
   }, [voucherStats.count]);
 
-  // Simple file upload - NO COMPLEX STREAMING
-  const handleFileUpload = useCallback((event) => {
+  // Enhanced file upload with streaming for large files
+  const handleFileUpload = useCallback(async (event) => {
     const file = event.target.files[0];
     if (!file) return;
 
+    // Reset states
     setIsProcessing(true);
+    setProcessingProgress({ 
+      lines: 0, 
+      vouchers: 0, 
+      percentage: 0,
+      chunksProcessed: 0,
+      totalChunks: 0
+    });
+    setVoucherCount(0);
     setFileInfo({ name: file.name, size: file.size });
 
-    // 200MB limit
-    const maxSize = 200 * 1024 * 1024;
+    // 500MB limit (increased for large datasets)
+    const maxSize = 500 * 1024 * 1024;
     if (file.size > maxSize) {
-      alert('File terlalu besar! Maximum 200MB.');
+      alert('❌ File terlalu besar! Maximum 500MB.');
       setIsProcessing(false);
+      setProcessingProgress({ 
+        lines: 0, 
+        vouchers: 0, 
+        percentage: 0,
+        chunksProcessed: 0,
+        totalChunks: 0
+      });
       return;
     }
 
-    const reader = new FileReader();
-    
-    reader.onload = (e) => {
-      const text = e.target.result;
-      setVoucherData(text);
-      
-      // Process with Web Worker
-      workerRef.current.postMessage({
-        type: 'PROCESS_VOUCHERS',
-        text: text
-      });
-    };
-    
-    reader.onerror = () => {
-      alert('Gagal membaca file!');
-      setIsProcessing(false);
-    };
+    // Check if it's a large dataset
+    const isLarge = file.size > 10 * 1024 * 1024; // > 10MB
+    setIsLargeDataset(isLarge);
 
-    reader.readAsText(file, 'UTF-8');
+    try {
+      if (isLarge) {
+        console.log(`🚀 Processing large file (${(file.size / 1024 / 1024).toFixed(2)}MB) with streaming...`);
+        await processFileStreaming(file);
+      } else {
+        console.log('🔄 Processing small file with standard method...');
+        const text = await file.text();
+        
+        const quickResult = processVoucherTextQuick(text);
+        if (quickResult) {
+          // Small dataset, process immediately
+          voucherListRef.current = quickResult;
+          setVoucherCount(quickResult.length);
+          setIsProcessing(false);
+          setBallsKey(prev => prev + 1);
+        } else {
+          // Use worker even for medium datasets
+          workerRef.current.postMessage({
+            type: 'PROCESS_SMALL',
+            text: text
+          });
+        }
+      }
+    } catch (error) {
+      console.error('File processing error:', error);
+      alert('❌ Gagal memproses file: ' + error.message);
+      setIsProcessing(false);
+      setProcessingProgress({ 
+        lines: 0, 
+        vouchers: 0, 
+        percentage: 0,
+        chunksProcessed: 0,
+        totalChunks: 0
+      });
+    }
+  }, [processVoucherTextQuick, processFileStreaming]);
+
+  // Abort processing function
+  const abortProcessing = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    if (workerRef.current) {
+      workerRef.current.postMessage({ type: 'ABORT' });
+    }
+    setIsProcessing(false);
+    setProcessingProgress({ 
+      lines: 0, 
+      vouchers: 0, 
+      percentage: 0,
+      chunksProcessed: 0,
+      totalChunks: 0
+    });
   }, []);
 
   // Template download
@@ -383,14 +636,21 @@ UGP00025-20241007-038590
 UGP00025-20241007-038591
 UGP00025-20241007-038592`, []);
 
-  // Text change handler
+  // Optimized text change handler
   const handleTextChange = useCallback((e) => {
     const value = e.target.value;
     setVoucherData(value);
-    if (value.trim()) {
-      setBallsKey(prev => prev + 1);
+    
+    // Quick processing for small text input
+    const quickResult = processVoucherTextQuick(value);
+    if (quickResult) {
+      voucherListRef.current = quickResult;
+      setVoucherCount(quickResult.length);
+      if (value.trim()) {
+        setBallsKey(prev => prev + 1);
+      }
     }
-  }, []);
+  }, [processVoucherTextQuick]);
 
   // Format number for display
   const formatNumber = useCallback((num) => {
@@ -420,6 +680,81 @@ UGP00025-20241007-038592`, []);
               }}
             />
           ))}
+        </div>
+      )}
+
+      {/* Processing Progress Modal */}
+      {isProcessing && (
+        <div className="processing-modal">
+          <div className="processing-content">
+            <div className="processing-header">
+              <Zap className="processing-icon" size={32} />
+              <h3>Memproses Data Voucher</h3>
+            </div>
+            
+            <div className="processing-stats">
+              <div className="stat-item">
+                <span className="stat-label">File:</span>
+                <span className="stat-value">{fileInfo.name}</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Ukuran:</span>
+                <span className="stat-value">{(fileInfo.size / 1024 / 1024).toFixed(2)} MB</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Voucher Diproses:</span>
+                <span className="stat-value">{formatNumber(processingProgress.vouchers)}</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Baris Diproses:</span>
+                <span className="stat-value">{formatNumber(processingProgress.lines)}</span>
+              </div>
+              {processingProgress.totalChunks > 0 && (
+                <div className="stat-item">
+                  <span className="stat-label">Chunk Progress:</span>
+                  <span className="stat-value">
+                    {processingProgress.chunksProcessed}/{processingProgress.totalChunks}
+                  </span>
+                </div>
+              )}
+            </div>
+            
+            <div className="processing-progress">
+              <div className="progress-bar">
+                <div 
+                  className="progress-fill" 
+                  style={{ 
+                    width: `${Math.max(processingProgress.percentage, 10)}%`,
+                    animation: processingProgress.percentage > 0 ? 'pulse 2s infinite' : 'none'
+                  }}
+                ></div>
+              </div>
+              <div className="progress-text">
+                {processingProgress.percentage > 0 
+                  ? `${Math.round(processingProgress.percentage)}% - ${formatNumber(processingProgress.vouchers)} vouchers processed`
+                  : isLargeDataset 
+                    ? '🚀 Streaming processor aktif untuk dataset besar...' 
+                    : '⚡ Memproses data...'
+                }
+              </div>
+            </div>
+            
+            <div className="processing-tips">
+              <AlertCircle size={16} />
+              <span>
+                {isLargeDataset 
+                  ? 'Dataset besar terdeteksi. Menggunakan teknologi streaming untuk performa optimal.'
+                  : 'Harap tunggu, data sedang diproses...'}
+              </span>
+            </div>
+            
+            <button 
+              onClick={abortProcessing}
+              className="abort-button"
+            >
+              Batalkan
+            </button>
+          </div>
         </div>
       )}
 
@@ -634,11 +969,12 @@ UGP00025-20241007-038592`, []);
                   </button>
                 </div>
                 <p className="upload-note">
-                  📁 Format: CSV/TXT | Max: 200MB | Ultra-Optimized: 5M+ vouchers
+                  📁 Format: CSV/TXT | Max: 500MB | Ultra-Optimized: 10M+ vouchers ⚡
                   {fileInfo.name && (
                     <>
                       <br />
-                      File: {fileInfo.name} ({(fileInfo.size / 1024 / 1024).toFixed(2)} MB)
+                      📄 File: {fileInfo.name} ({(fileInfo.size / 1024 / 1024).toFixed(2)} MB)
+                      {isLargeDataset && <span className="large-dataset-badge">🚀 LARGE DATASET</span>}
                     </>
                   )}
                 </p>
@@ -647,7 +983,7 @@ UGP00025-20241007-038592`, []);
               <textarea
                 value={voucherData}
                 onChange={handleTextChange}
-                placeholder="Masukkan kode voucher (satu per baris atau pisahkan dengan koma)&#10;Atau upload file CSV/TXT untuk 1M+ voucher&#10;&#10;Tips: Untuk performa optimal dengan data besar, gunakan upload file&#10;&#10;Contoh:&#10;UGP00025-20241007-038563&#10;UGP00025-20241007-038564,UGP00025-20241007-038565"
+                placeholder="Masukkan kode voucher (satu per baris atau pisahkan dengan koma)&#10;Atau upload file CSV/TXT untuk 10M+ voucher dengan streaming processor&#10;&#10;🚀 Tips: Untuk dataset mega (1M+), gunakan upload file untuk performa optimal&#10;⚡ Streaming technology: Real-time processing tanpa freeze browser&#10;&#10;Contoh:&#10;UGP00025-20241007-038563&#10;UGP00025-20241007-038564,UGP00025-20241007-038565"
                 className="enhanced-textarea"
                 disabled={isSpinning || isProcessing}
               />
@@ -656,7 +992,12 @@ UGP00025-20241007-038592`, []);
                 <button
                   onClick={() => {
                     setVoucherData(sampleVouchers);
-                    setBallsKey(prev => prev + 1);
+                    const quickResult = processVoucherTextQuick(sampleVouchers);
+                    if (quickResult) {
+                      voucherListRef.current = quickResult;
+                      setVoucherCount(quickResult.length);
+                      setBallsKey(prev => prev + 1);
+                    }
                   }}
                   className="enhanced-sample-button"
                   disabled={isSpinning || isProcessing}
@@ -667,7 +1008,9 @@ UGP00025-20241007-038592`, []);
                   onClick={() => {
                     setVoucherData('');
                     voucherListRef.current = [];
+                    setVoucherCount(0);
                     setFileInfo({ name: '', size: 0 });
+                    setIsLargeDataset(false);
                     setBallsKey(prev => prev + 1);
                   }}
                   className="enhanced-clear-button"
@@ -715,6 +1058,18 @@ UGP00025-20241007-038592`, []);
                   </div>
                 </div>
               </div>
+              
+              {/* Performance indicator for large datasets */}
+              {voucherStats.count > 100000 && (
+                <div className="performance-indicator">
+                  <div className="performance-badge">
+                    🚀 MEGA DATASET DETECTED
+                  </div>
+                  <div className="performance-text">
+                    Ultra-optimized for {formatNumber(voucherStats.count)} vouchers
+                  </div>
+                </div>
+              )}
             </div>
 
             {winner && (
@@ -733,10 +1088,13 @@ UGP00025-20241007-038592`, []);
                       day: 'numeric' 
                     })}
                   </div>
+                  <div className="winner-stats">
+                    Dipilih dari {formatNumber(voucherStats.count)} voucher
+                  </div>
                 </div>
                 <button
                   onClick={() => {
-                    const result = `HASIL UNDIAN VOUCHER ULTRA\n\nVoucher Pemenang: ${winner}\nTanggal: ${new Date().toLocaleDateString('id-ID')}\nWaktu: ${new Date().toLocaleTimeString('id-ID')}\nTotal Peserta: ${formatNumber(voucherStats.count)}\n\nSelamat kepada pemenang! 🎉`;
+                    const result = `HASIL UNDIAN VOUCHER ULTRA\n\nVoucher Pemenang: ${winner}\nTanggal: ${new Date().toLocaleDateString('id-ID')}\nWaktu: ${new Date().toLocaleTimeString('id-ID')}\nTotal Peserta: ${formatNumber(voucherStats.count)}\n\nSelamat kepada pemenang! 🎉\n\n---\nPowered by Ultra Voucher Lottery Machine\nOptimized for ${formatNumber(voucherStats.count)} vouchers`;
                     const blob = new Blob([result], { type: 'text/plain' });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
@@ -755,6 +1113,178 @@ UGP00025-20241007-038592`, []);
           </div>
         </div>
       </div>
+
+      {/* Add required CSS styles */}
+      <style jsx>{`
+        .processing-modal {
+          position: fixed;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          background: rgba(0, 0, 0, 0.8);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 10000;
+          backdrop-filter: blur(5px);
+        }
+
+        .processing-content {
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          border-radius: 20px;
+          padding: 30px;
+          max-width: 500px;
+          width: 90%;
+          color: white;
+          text-align: center;
+          box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+          border: 2px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .processing-header {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 15px;
+          margin-bottom: 25px;
+        }
+
+        .processing-header h3 {
+          margin: 0;
+          font-size: 24px;
+          font-weight: bold;
+        }
+
+        .processing-icon {
+          animation: rotate 2s linear infinite;
+        }
+
+        @keyframes rotate {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+
+        .processing-stats {
+          display: grid;
+          gap: 10px;
+          margin-bottom: 25px;
+          text-align: left;
+        }
+
+        .stat-item {
+          display: flex;
+          justify-content: space-between;
+          padding: 8px 15px;
+          background: rgba(255, 255, 255, 0.1);
+          border-radius: 10px;
+          backdrop-filter: blur(10px);
+        }
+
+        .stat-label {
+          font-weight: 500;
+          opacity: 0.9;
+        }
+
+        .stat-value {
+          font-weight: bold;
+          color: #FFD700;
+        }
+
+        .processing-progress {
+          margin-bottom: 20px;
+        }
+
+        .progress-bar {
+          width: 100%;
+          height: 8px;
+          background: rgba(255, 255, 255, 0.2);
+          border-radius: 4px;
+          overflow: hidden;
+          margin-bottom: 10px;
+        }
+
+        .progress-fill {
+          height: 100%;
+          background: linear-gradient(90deg, #FFD700, #FFA500);
+          transition: width 0.3s ease;
+        }
+
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.7; }
+        }
+
+        .progress-text {
+          font-size: 14px;
+          opacity: 0.9;
+          margin-bottom: 15px;
+        }
+
+        .processing-tips {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          background: rgba(255, 255, 255, 0.1);
+          padding: 12px;
+          border-radius: 10px;
+          font-size: 14px;
+          margin-bottom: 20px;
+        }
+
+        .abort-button {
+          background: rgba(255, 255, 255, 0.2);
+          color: white;
+          border: none;
+          padding: 12px 24px;
+          border-radius: 10px;
+          cursor: pointer;
+          font-weight: bold;
+          transition: all 0.3s ease;
+          backdrop-filter: blur(10px);
+        }
+
+        .abort-button:hover {
+          background: rgba(255, 255, 255, 0.3);
+          transform: translateY(-2px);
+        }
+
+        .large-dataset-badge {
+          background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+          color: white;
+          padding: 2px 8px;
+          border-radius: 12px;
+          font-size: 11px;
+          font-weight: bold;
+          margin-left: 8px;
+        }
+
+        .performance-indicator {
+          margin-top: 15px;
+          padding: 12px;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          border-radius: 12px;
+          text-align: center;
+          color: white;
+        }
+
+        .performance-badge {
+          font-weight: bold;
+          font-size: 12px;
+          margin-bottom: 5px;
+        }
+
+        .performance-text {
+          font-size: 11px;
+          opacity: 0.9;
+        }
+
+        .winner-stats {
+          font-size: 12px;
+          opacity: 0.7;
+          margin-top: 8px;
+        }
+      `}</style>
     </div>
   );
 };
